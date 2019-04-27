@@ -1,0 +1,221 @@
+---
+title: "Forecasting Uber Trips in NYC Using a SARIMA Model"
+author: "Cole M. Morgan"
+date: "4/18/2019"
+output:
+  pdf_document: default
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Background and Key Questions
+Uber is a global ride sharing service that handles tens of thousands to hundreds of thousands of trips every day just a single city. For Uber forecasting the number of pickups and drop offs is extremely important because it helps them plan and prepare for variable demand of cars and drivers which if done accurately can yield them large economic benefits. I will look at the number of Uber rides per day in New York City from a five month period (January 2015 to June 2015). In the process of forecasting this time series I will investigate whether Uber trips by day have an underlying signal that contains components such as seasonality and/or trend. After exploring the data I will fit SARIMA based models on a training set of data. The evaluation metric I will compare the models by will be their respective Akaike information criterion scores. Next I will test the best model’s ability to predict the number of trips in the future by comparing a one month out forecast with one month of hold out test data. I will evaluate the error using the mean absolute error calculation.  
+
+
+The two key questions I will investigate are:
+
+- Is it possible to accurately predict the number of Uber trips per day using a SARIMA based model?
+
+- What is the accuracy of the forecasts made by the SARIMA model?
+  
+
+To answer these questions I will first visual examine the time series at different level of aggregation to get a sense of the data. After that I will try to remove any trend that I find and then investigate for seasonality, AR, or MA components. After both of these first two steps I will then model it using an appropriately tuned arima or sarima model using my findings from the previous step. After fitting the model on the train data I will evaluate its true performance by predicting on a hold out set of test data. 
+
+## Exploritory Data Analysis
+The data contains individual Uber trips including their date and time. The training data is from New York City from January 2105 through May 2015, and the test data is just June 2015. I will be primarily focused on forecasting the trip count at an aggregate by day level. I received the data from Professor Devika Submaranian, she created this data set for a graduate research program.  
+
+
+```{r, include=FALSE, echo=FALSE}
+library(ggplot2)
+library(forecast)
+library("fma")
+library("expsmooth")
+library(fpp2)
+train_data <- read.csv("/Users/school/Classes/Spring19/STAT\ 421/Final\ Project/data/train_df.csv")
+test_data <- read.csv("/Users/school/Classes/Spring19/STAT\ 421/Final\ Project/data/test_df.csv")
+
+train_df <- as.data.frame(train_data)
+train_df <- train_df[(train_df$date != "2015-05-31"), ]
+test_df <- as.data.frame(test_data)
+```
+
+```{r, echo=FALSE}
+byhour <- data.frame(table(train_df$hour)/150)
+bydate <- data.frame(table(train_df$date))[1:150,]
+bydatehour <- data.frame(table(train_df$hour, train_df$date))[1:3600,]
+bydatehour <- transform(bydatehour, newcol=paste(Var2, Var1, sep="_"))
+
+test_byhour <- data.frame(table(test_df$hour))
+test_bydate <- data.frame(table(test_df$date))
+test_bydatehour <- data.frame(table(test_df$hour, test_df$date))
+test_bydatehour <- transform(test_bydatehour, newcol=paste(Var2, Var1, sep="_"))
+```
+
+ 
+```{r, echo=FALSE}
+plot(x = byhour$Var1, y= byhour$Freq,type="n", xlab = "Hour", ylab = "Average number of trips")
+lines(byhour$Var1, byhour$Freq,type="l")
+title("Average Uber trips over the course of a day") 
+
+plot(bydate$Var1,bydate$Freq,type="n", xlab = "Date", ylab = "Number of trips")
+lines(bydate$Var1,bydate$Freq,type="l")
+title("Number of trips per day")
+
+plot(bydatehour$newcol,bydatehour$Freq, xlab = "Date, Hour", ylab = "Number of trips")
+lines(bydatehour$newcol,bydatehour$Freq,type="l")
+title("Number of trips by hour")
+```
+
+Plotting the average number of trips per hour for one day shows us that there is a 24 hour cyclic pattern, but since I am aggregating to the by day level this will not matter. This same pattern is observed repeating itself every 24 hours in the number of trips by hour plot. The Number of trips per day plot shows us that there is a general upward trend to the data and that there appears to be a 7 day or weekly cycle in the data. To investigate further I will first look at whether the time series of by day truly has a trend. I then will look at the ACF and PACF of the detrended time series.
+
+```{r, echo=FALSE}
+byday <- ts(bydate$Freq, frequency = 365, start = c(2015))
+test_byday <- ts(test_bydate$Freq, frequency = 365, start = c(2015, 151))
+
+plot(byday, ylab = "Number of trips", xlab = "Date")
+title("Uber trips by day with rolling mean")
+lines(smooth.spline(time(byday), byday, spar=.75), lwd=2, col=4)
+
+#tseries::adf.test(byday,"explosive")
+
+diff <- diff(byday,lag = 1 )
+plot(diff, main = "Uber trips by day after single lag differencing")
+lines(smooth.spline(time(diff), diff, spar=.7), lwd=2, col=4)
+```
+
+To first determine if the series contained a general trend I plotted the data along with its spline smoothed mean. From this plot I saw that the series had general upward drift, meaning it is not trend stationary. To handle this I decided to difference the series by a single lag. The single lag differencing resulted in a plot that appears to be trend stationary. The next logical step is to investigate the ACF and PACF of the single lag differenced time series. 
+
+
+```{r, echo=FALSE}
+ggAcf(diff, main = "ACF of single lag differenced TS")
+ggPacf(diff, main = "PACF of single lag differenced TS")
+```
+
+Looking at the ACF and PACF I attempted to determine the AR and MA order of the single lag differenced time series. From the ACF I saw that there was a strong seasonal component still in the data which had a cycle of 7 lags (one week). Since the ACF and PACF are hard to interpret for the AR and MA order while this seasonal component is present I decided to do another difference of 7 lags.
+
+
+```{r, echo=FALSE}
+seasonal_lag = 7
+seasonaldiff <- diff(diff,lag = seasonal_lag )
+#tseries::adf.test(diff,"explosive", seasonal_lag)
+
+plot(diff(diff,lag = seasonal_lag ), main = "Series that has single lag and seasonal lag differencing")
+lines(smooth.spline(time(diff(diff,lag = seasonal_lag)), diff(diff,lag = seasonal_lag), spar=.7), lwd=2, col=4)
+
+acfvals <- ggAcf(seasonaldiff, plot = FALSE)
+pacfvals <- ggPacf(seasonaldiff, plot = FALSE)
+
+#which(abs(acfvals$acf) > .095) 
+#which(abs(pacfvals$acf) > .095) 
+ggAcf(seasonaldiff)
+ggPacf(seasonaldiff)
+```
+
+Differencing by 7 lags yielded me a time series that was still trend stationary. I once again plotted the ACF and PACF of the twice differenced series. The ACF shows a sharp cut off after lag 7. It also has two lags that are significant: lag 1 and lag 7. The PACF shows a exponentially decreasing in magnitude pattern after lag 7 and it also only has two lags that are significant lag 1 and 7 again. From this evaluation the most likely model must have differencing for the seasonal and non seasonal component and be an MA order 1 for both the seasonal and non seasonal. This logic yields: $ARIMA(0,1,1) \times ARIMA(0,1,1)[7]$.
+
+## Modeling Dailly Uber Trips
+
+I begin the modeling process with the starting model arrived to in the previous section:$ARIMA(0,1,1) \times ARIMA(0,1,1)[7]$. 
+```{r}
+fit <- astsa::sarima(byday, 0, 1, 1, P = 0, D = 1, Q = 1, S = 7, 
+       details = TRUE, xreg=NULL, Model=TRUE,
+       tol = sqrt(.Machine$double.eps), 
+       no.constant = FALSE)
+ggAcf(resid(fit$fit))
+ggPacf(resid(fit$fit))
+fit$AIC
+```
+
+The model seems to be fitting quite well since the AIC is relatively low. The ACF and PACF of the residuals do not have any worrying significant features. But I still think that the models parameter tuning could be better. To find a better fit I swept through similar models and compare them using AIC.
+
+
+From my parameter sweep I found this $ARIMA(0,1,6) \times ARIMA(0,1,1)[7]$ to be the best in terms of AIC.
+```{r}
+
+fit <- astsa::sarima(byday, 0, 1, 6, P = 0, D = 1, Q = 1, S = 7, 
+       details = TRUE, xreg=NULL, Model=TRUE,
+       tol = sqrt(.Machine$double.eps), 
+       no.constant = FALSE)
+ggAcf(resid(fit$fit))
+ggPacf(resid(fit$fit))
+fit
+fit$AIC
+```
+
+The model has the lowest AIC of 18.85781 and has no ACF or PACF values that are significant. However, upon looking at the pvalues in the ttable for the added MA coefficients non of them are significant meaning the original simpler model was actually the best. The simpler model was this $ARIMA(0,1,1) \times ARIMA(0,1,1)[7]$ model. Next I look at the fit of $ARIMA(0,1,1) \times ARIMA(0,1,1)[7]$ against the true data that it trained on to get a visual sense of how well the model is actually fitting.
+
+```{r, include = FALSE}
+fit <- astsa::sarima(byday, 0, 1, 1, P = 0, D = 1, Q = 1, S = 7, 
+       details = TRUE, xreg=NULL, Model=TRUE,
+       tol = sqrt(.Machine$double.eps), 
+       no.constant = FALSE)
+```
+
+```{r, echo=FALSE}
+
+fit_vals <- resid(fit$fit)+byday
+ts.plot(byday,col="red")
+lines(fit_vals,col="blue")
+title("Fitted Values Overlaid with True Values")
+legend("bottomright", 
+  legend = c("True Values", "Fitted Values"), 
+  col = c("red", 
+  "blue"), 
+  pch = c(17,19), 
+  bty = "n", 
+  pt.cex = 2, 
+  cex = .7, 
+  text.col = "black", 
+  horiz = F , 
+  inset = c(0.0, 0.0))
+```
+
+## Forecasting and Testing
+
+Using the best model in terms of AIC trained on 4 months of data I forecasted one month out to compare on one month of hold out data. The plot of the true values one month out and the predicted values is below
+
+```{r, echo=FALSE}
+#plot(test_byday)
+#length(test_byday)
+#predict(fit$fit, 31)$pred
+
+
+test_vals <- ts(test_byday, frequency = 365, start = c(2015, 151))
+pred_test_vals <- ts(predict(fit$fit, 31)$pred, frequency = 365, start = c(2015, 151))
+
+plot(test_vals, col = "red")
+lines(pred_test_vals, col = "blue")
+title("PRedicted Values Overlaid with True Values")
+legend("bottomright", 
+  legend = c("True Values", "Predicted Values"), 
+  col = c("red", 
+  "blue"), 
+  pch = c(17,19), 
+  bty = "n", 
+  pt.cex = 2, 
+  cex = .7, 
+  text.col = "black", 
+  horiz = F , 
+  inset = c(0.0, 0.0))
+mae <- (1/length(test_vals)) * sum(abs(pred_test_vals - test_vals))
+mae
+
+```
+
+The $ARIMA(0,1,1) \times ARIMA(0,1,1)[7]$ model seems to be generalizing quite well even while trained on such a small sample compared to the forecast window. The mean absolute error was 5455 over the one month forecast period. For values that are in the range of roughly 80 thousand to 120 thousand being off on average by 5 thousand is pretty good. 
+
+
+## Conclusions and Future Questions
+
+Using SARIMA based models can in fact help us fit and predict dialy Uber trip numbers in New York City. The model performed will on the train and test set and was able to predict out over quite a large horizon compared to its training set. The Uber data was quite interesting since it required regular and seasonal differencing in order to obtain its true AR and MA order. Hopefully Uber uses similar forecasting methods to help predict and then plan for future variable demand.
+
+My next step will be to try to model the hourly series of this Uber data. Although I have already tried once the high lag order of the weekly seasonal component, 168, means that R's optimization function fails while training on this data. The hourly Uber data is interesting to me since it has two concurrent seasonal effects the weekly seasonal effect of period 168 and a daily seasonal effect of period 24. If I have the time my next inquiry will be into modeling this granularity of the data. 
+
+
+
+
